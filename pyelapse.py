@@ -1,11 +1,13 @@
 import os
-from pathlib import Path
+import calendar
 
 import cv2
 import click
 import json
 import subprocess
 import shutil
+from pathlib import Path
+
 from datetime import datetime
 
 
@@ -19,7 +21,13 @@ def cli():
 @click.option('--fps', default=24, help='Frames per second for the output video.')
 @click.option('--output', default='output.mp4', help='Output video file name.')
 def create_timelapse(folder, fps, output):
-    # Get sorted list of image files
+    """
+    Create a time-lapse video from images in a folder.
+    :param folder: Path to the folder containing images.
+    :param fps: frames per second for the output video.
+    :param output: filename for the output video.
+    :return: None
+    """
     images = sorted([
         os.path.join(folder, f)
         for f in os.listdir(folder)
@@ -29,11 +37,9 @@ def create_timelapse(folder, fps, output):
         click.secho('No images found in the folder.', fg='red')
         return
 
-    # Read first image to get frame size
     frame = cv2.imread(images[0])
     height, width, _ = frame.shape
 
-    # Define video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output, fourcc, fps, (width, height))
 
@@ -46,16 +52,6 @@ def create_timelapse(folder, fps, output):
     out.release()
     click.secho(f'Time-lapse video saved as {output}', fg='green', bold=True)
 
-
-
-def is_night_time(dt):
-    mins = dt.hour * 60 + dt.minute
-    return mins >= 1350 or mins <= 270  # 22:30–23:59 or 00:00–04:30
-
-def is_weekend(dt):
-    return dt.weekday() >= 5  # 5=Saturday, 6=Sunday
-
-import calendar
 
 def parse_timeframe(timeframe):
     start_str, end_str = timeframe.split('-')
