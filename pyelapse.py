@@ -45,11 +45,12 @@ def create_timelapse(folder, fps, output):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output, fourcc, fps, (width, height))
 
-    for img_path in images:
-        img = cv2.imread(img_path)
-        if img.shape[:2] != (height, width):
-            img = cv2.resize(img, (width, height))
-        out.write(img)
+    with click.progressbar(images, label="Creating timelapse") as bar:
+        for img_path in bar:
+            img = cv2.imread(img_path)
+            if img.shape[:2] != (height, width):
+                img = cv2.resize(img, (width, height))
+            out.write(img)
 
     out.release()
     click.secho(f'Time-lapse video saved as {output}', fg='green', bold=True)
@@ -208,6 +209,65 @@ def batch_crop(input_folder, output_folder, start_x, start_y, end_x, end_y, rota
             click.secho(f"Cropped and saved: {img_path.name}", fg='green')
         except Exception as e:
             click.secho(f"Failed to crop {img_path.name}: {e}", fg='red')
+
+@cli.command('normalize-intervals')
+@click.argument('input_folder', type=click.Path(exists=True, file_okay=False))
+@click.argument('output_folder', type=click.Path())
+@click.option('--target-minutes', type=int, default=1, show_default=True, help='Target interval in minutes between frames.')
+def normalize_intervals(input_folder, output_folder, target_minutes):
+    """
+    Normalize image intervals by duplicating or skipping frames so all intervals match target_minutes.
+    """
+    input_folder = Path(input_folder)
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    exts = (".jpg", ".jpeg", ".png", ".tiff")
+    files = [f for f in input_folder.iterdir() if f.suffix.lower() in exts and f.is_file()]
+    if not files:
+        click.secho("No image files found.", fg='red')
+        return
+
+    # Extract timestamps and sort
+    images_with_dt = []
+    for img_path in files:
+        try:
+            with open(img_path, 'rb') as f:
+                tags = exifread.process_file(f, stop_tag="EXIF DateTimeOriginal", details=False)
+                dt_str = str(tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime"))
+            if dt_str and dt_str != "None":
+                dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+                images_with_dt.append((dt, img_path))
+        except Exception:
+            continue
+
+    images_with_dt.sort()
+    if not images_with_dt:
+        click.secho("No images with valid EXIF date/time found.", fg='red')
+        return
+
+    target_delta = target_minutes * 60  # seconds
+    prev_dt = None
+    for i, (dt, img_path) in enumerate(images_with_dt):
+        if i == 0:
+            repeats = 1
+        else:
+            delta = int((dt - prev_dt).total_seconds())
+            repeats = max(1, round(delta / target_delta))
+        for rep in range(repeats):
+            # Use EXIF date/time for filename, add a counter if needed
+            base_name = dt.strftime("%Y-%m-%d-%H-%M-%S")
+            out_name = f"{base_name}{img_path.suffix.lower()}"
+            out_path = output_folder / out_name
+            counter = 1
+            while out_path.exists():
+                out_name = f"{base_name}-{counter}{img_path.suffix.lower()}"
+                out_path = output_folder / out_name
+                counter += 1
+            shutil.copy2(img_path, out_path)
+        prev_dt = dt
+
+    click.secho(f"Normalized sequence saved to {output_folder}", fg='green')
 
 
 if __name__ == '__main__':

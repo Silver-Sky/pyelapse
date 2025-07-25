@@ -48,3 +48,14 @@ python pyelapse.py batch-crop /input /output --start-x 100 --start-y 50 --end-x 
 python pyelapse.py batch-crop /input /output --start-x 100 --start-y 50 --end-x 700 --end-y 950 --rename Own_Name
 ```
 This will produce files like `2024-06-07-14-30-00-Own_Name.jpg`.
+
+## Normalize Image Intervals
+
+If your images have different time intervals (e.g., some 3 minutes apart, some 1 minute apart), you can normalize them so the video plays at a constant speed:
+
+```bash
+python pyelapse.py normalize-intervals /path/to_input_folder/ /path/to_output_folder/ --target-minutes 1
+```
+
+- This will duplicate or skip frames as needed so all intervals match the target (e.g., 1 minute).
+- Use the output folder as input for your time-lapse creation.
