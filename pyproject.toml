@@ -1,0 +1,19 @@
+[project]
+name = "pyelapse"
+version = "0.1.0"
+description = "A CLI tool to create time-lapse videos from images, with cropping, normalization, and filtering."
+authors = [
+    { name = "Silver-Sky", email = "silversky@mail.ch" }
+]
+requires-python = ">=3.8"
+readme = "README.md"
+dependencies = [
+    "click>=8.0",
+    "Pillow>=9.0",
+    "opencv-python>=4.5",
+    "exifread>=3.0"
+]
+
+[project.scripts]
+pyelapse = "pyelapse:cli"
+

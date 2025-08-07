@@ -10,7 +10,8 @@ from pathlib import Path
 from PIL import Image
 import exifread
 
-from datetime import datetime
+from datetime import datetime, timedelta
+import concurrent.futures
 
 
 @click.group()
@@ -21,8 +22,9 @@ def cli():
 @cli.command('create-timelapse')
 @click.argument('folder', type=click.Path(exists=True, file_okay=False))
 @click.option('--fps', default=24, help='Frames per second for the output video.')
-@click.option('--output', default='output.mp4', help='Output video file name.')
-def create_timelapse(folder, fps, output):
+@click.option('--output', default='output.mov', help='Output video file name (H.264 in .mov container).')
+@click.option('--crf', type=int, default=None, help='Compress output using ffmpeg with given CRF (lower is better, 18-28).')
+def create_timelapse(folder, fps, output, crf):
     """
     Create a time-lapse video from images in a folder.
     :param folder: Path to the folder containing images.
@@ -42,7 +44,31 @@ def create_timelapse(folder, fps, output):
     frame = cv2.imread(images[0])
     height, width, _ = frame.shape
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Select codec based on file extension
+    ext = os.path.splitext(output)[1].lower()
+    if ext == ".mov":
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 for .mov
+        codec_name = "H.264 (avc1) in .mov"
+    elif ext in [".mp4", ".m4v"]:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # H.264/MP4
+        codec_name = "H.264 (mp4v) in .mp4/.m4v"
+    elif ext == ".mkv":
+        fourcc = cv2.VideoWriter_fourcc(*'X264')  # H.264 for .mkv
+        codec_name = "H.264 (X264) in .mkv"
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Default to mp4v
+        codec_name = "H.264 (mp4v) default"
+
+    click.secho("=== Timelapse Creation Details ===", fg='cyan', bold=True)
+    click.secho(f"Images used: {len(images)}", fg='blue')
+    click.secho(f"Resolution: {width}x{height}", fg='blue')
+    click.secho(f"FPS: {fps}", fg='blue')
+    click.secho(f"Codec: {codec_name}", fg='blue')
+    click.secho(f"Output file: {output}", fg='blue')
+    click.secho(f"First image: {os.path.basename(images[0])}", fg='blue')
+    click.secho(f"Last image: {os.path.basename(images[-1])}", fg='blue')
+    click.secho("=" * 32, fg='cyan')
+
     out = cv2.VideoWriter(output, fourcc, fps, (width, height))
 
     with click.progressbar(images, label="Creating timelapse") as bar:
@@ -53,7 +79,23 @@ def create_timelapse(folder, fps, output):
             out.write(img)
 
     out.release()
-    click.secho(f'Time-lapse video saved as {output}', fg='green', bold=True)
+    click.secho(f"Time-lapse video saved as {output}", fg='green', bold=True)
+
+    # Compress with ffmpeg if requested
+    if crf is not None:
+        compressed_output = Path(output).with_stem(Path(output).stem + "_compressed")
+        cmd = [
+            "ffmpeg", "-y", "-i", output,
+            "-vcodec", "libx264", "-crf", str(crf),
+            "-preset", "slow",
+            str(compressed_output)
+        ]
+        click.secho(f"Compressing {output} to {compressed_output} with CRF={crf}...", fg='yellow')
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode == 0:
+            click.secho(f"Compressed video saved as {compressed_output}", fg='green', bold=True)
+        else:
+            click.secho(f"Compression failed: {result.stderr.decode()}", fg='red')
 
 
 def parse_timeframe(timeframe):
@@ -194,7 +236,7 @@ def batch_crop(input_folder, output_folder, start_x, start_y, end_x, end_y, rota
         click.secho("No image files found.", fg='red')
         return
 
-    for img_path in files:
+    def process_image(img_path):
         try:
             with Image.open(img_path) as im:
                 exif = im.info.get('exif')
@@ -206,9 +248,18 @@ def batch_crop(input_folder, output_folder, start_x, start_y, end_x, end_y, rota
                     cropped.save(out_path, exif=exif)
                 else:
                     cropped.save(out_path)
-            click.secho(f"Cropped and saved: {img_path.name}", fg='green')
+            return f"Cropped and saved: {img_path.name}"
         except Exception as e:
-            click.secho(f"Failed to crop {img_path.name}: {e}", fg='red')
+            return f"Failed to crop {img_path.name}: {e}"
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        results = list(executor.map(process_image, files))
+    for res in results:
+        click.secho(res, fg='green' if res.startswith("Cropped") else 'red')
+
+def copy_image(dt, img_path, out_path):
+    shutil.copy2(img_path, out_path)
+    return out_path
 
 @cli.command('normalize-intervals')
 @click.argument('input_folder', type=click.Path(exists=True, file_okay=False))
@@ -216,7 +267,7 @@ def batch_crop(input_folder, output_folder, start_x, start_y, end_x, end_y, rota
 @click.option('--target-minutes', type=int, default=1, show_default=True, help='Target interval in minutes between frames.')
 def normalize_intervals(input_folder, output_folder, target_minutes):
     """
-    Normalize image intervals by duplicating or skipping frames so all intervals match target_minutes.
+    Normalize image intervals by skipping or duplicating frames so all intervals are exactly target_minutes apart.
     """
     input_folder = Path(input_folder)
     output_folder = Path(output_folder)
@@ -246,26 +297,39 @@ def normalize_intervals(input_folder, output_folder, target_minutes):
         click.secho("No images with valid EXIF date/time found.", fg='red')
         return
 
+    # Determine the range
+    first_dt = images_with_dt[0][0]
+    last_dt = images_with_dt[-1][0]
     target_delta = target_minutes * 60  # seconds
-    prev_dt = None
-    for i, (dt, img_path) in enumerate(images_with_dt):
-        if i == 0:
-            repeats = 1
-        else:
-            delta = int((dt - prev_dt).total_seconds())
-            repeats = max(1, round(delta / target_delta))
-        for rep in range(repeats):
-            # Use EXIF date/time for filename, add a counter if needed
-            base_name = dt.strftime("%Y-%m-%d-%H-%M-%S")
-            out_name = f"{base_name}{img_path.suffix.lower()}"
+
+    # Build normalized timeline
+    normalized_times = []
+    t = first_dt
+    while t <= last_dt:
+        normalized_times.append(t)
+        t = t + timedelta(seconds=target_delta)
+
+    # For each normalized time, find the closest image at or before that time
+    result = []
+    img_idx = 0
+    for norm_time in normalized_times:
+        # Advance img_idx to the last image at or before norm_time
+        while img_idx + 1 < len(images_with_dt) and images_with_dt[img_idx + 1][0] <= norm_time:
+            img_idx += 1
+        dt, img_path = images_with_dt[img_idx]
+        # Use EXIF date/time for filename, add a counter if needed
+        base_name = norm_time.strftime("%Y-%m-%d-%H-%M-%S")
+        out_name = f"{base_name}{img_path.suffix.lower()}"
+        out_path = output_folder / out_name
+        counter = 1
+        while out_path.exists():
+            out_name = f"{base_name}-{counter}{img_path.suffix.lower()}"
             out_path = output_folder / out_name
-            counter = 1
-            while out_path.exists():
-                out_name = f"{base_name}-{counter}{img_path.suffix.lower()}"
-                out_path = output_folder / out_name
-                counter += 1
-            shutil.copy2(img_path, out_path)
-        prev_dt = dt
+            counter += 1
+        result.append((dt, img_path, out_path))
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        list(executor.map(lambda args: copy_image(*args), result))
 
     click.secho(f"Normalized sequence saved to {output_folder}", fg='green')
 

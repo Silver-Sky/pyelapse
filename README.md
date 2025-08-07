@@ -59,3 +59,13 @@ python pyelapse.py normalize-intervals /path/to_input_folder/ /path/to_output_fo
 
 - This will duplicate or skip frames as needed so all intervals match the target (e.g., 1 minute).
 - Use the output folder as input for your time-lapse creation.
+
+## Create Timelapse Video
+
+You can compress the output `.mov` file using ffmpeg and H.264 by specifying the `--crf` option (lower values mean higher quality, typical range 18-28):
+
+```bash
+python pyelapse.py create-timelapse /path/to_image_folder/ --output output.mov --fps 24 --crf 23
+```
+
+This will create `output.mov` and then compress it to `output_compressed.mov` using ffmpeg.
