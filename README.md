@@ -2,12 +2,15 @@
 
 A Python script for creating time-lapse videos from images.
 
+If you have found this, you probably have the same issue I had: There are plenty of tools to manipulate images, but some of them lack bulk processing capabilities. This script is meant to fill that gap for my use case.
+I wanted to create a time-lapse video of my construction site and needed to remove night photos, weekends, crop images, and normalize the intervals of the images.
+It is far from perfect, but it works for me. If you have any suggestions or improvements, feel free to open an issue or a pull request.
+
 Example usage:
 
 ```bash
-source .venv/bin/activate
 python pyelapse.py remove-photos /path/to_image_folder/ --exclude-time 22:00-06:00 --exclude-days sat,sun
-python pyelapse.py create-video /path/to_image_folder/ --output path/time-elapse-video.mp4 --fps 30
+python pyelapse.py create-timelapse /path/to_image_folder/ --output path/time-elapse-video.mp4 --fps 30
 ```
 
 ## Remove Photos
