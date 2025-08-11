@@ -12,6 +12,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 0.1.2 or v0.1.2)'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -32,12 +37,17 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Set version from release tag
+      - name: Resolve version
         id: set_version
         run: |
-          TAG="${GITHUB_REF##*/}"
-          VERSION="${TAG#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "release" ]; then
+            RAW_REF="${GITHUB_REF##*/}"
+          else
+            RAW_REF="${{ github.event.inputs.version }}"
+          fi
+          RAW_REF="${RAW_REF#refs/tags/}"
+          RAW_REF="${RAW_REF#v}"
+          echo "version=$RAW_REF" >> "$GITHUB_OUTPUT"
 
       - name: Switch to master branch
         run: |
