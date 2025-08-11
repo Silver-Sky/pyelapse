@@ -2,7 +2,7 @@
 source .venv/bin/activate
 
 # Define intervals and folders
-intervals=(1 3)
+intervals=(1 3 15)
 folders=("1_Aushub_full" "2_Keller" "3_Keller_ferien" "4_Kanalisation")
 # folders=("4_Kanalisation")
 
