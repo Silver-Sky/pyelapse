@@ -1,9 +1,9 @@
 import os
 import calendar
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import click
-import json
 import subprocess
 import shutil
 from pathlib import Path
@@ -12,6 +12,7 @@ import exifread
 
 from datetime import datetime, timedelta
 import concurrent.futures
+ 
 
 
 @click.group()
@@ -19,24 +20,133 @@ def cli():
     """PyElapse CLI - Create time-lapse videos from images."""
     pass
 
+
+# -----------------------------
+# Utility helpers (fast paths)
+# -----------------------------
+
+ALLOWED_IMAGE_EXTENSIONS: Tuple[str, ...] = (
+    ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".raw", ".cr2", ".nef", ".arw"
+)
+
+
+def list_image_paths(folder: Path, allowed_exts: Sequence[str]) -> List[str]:
+    return sorted(
+        [str(folder / f) for f in os.listdir(folder) if f.lower().endswith(tuple(allowed_exts))]
+    )
+
+
+def list_images_recursive(folder: Path, allowed_exts: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    for root, _, filenames in os.walk(folder):
+        for f in filenames:
+            if f.lower().endswith(tuple(allowed_exts)):
+                out.append(str(Path(root) / f))
+    return out
+
+
+def read_exif_datetime(path: str) -> Optional[datetime]:
+    try:
+        with open(path, "rb") as f:
+            tags = exifread.process_file(
+                f, stop_tag="EXIF DateTimeOriginal", details=False
+            )
+            dt_str = str(tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime"))
+        if dt_str and dt_str != "None":
+            return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        return None
+    return None
+
+
+def precompute_timestamps(images: Sequence[str]) -> List[str]:
+    """Read EXIF datetimes for images in parallel and return printable strings."""
+    results: List[Optional[datetime]] = [None] * len(images)
+
+    def worker(idx_img: Tuple[int, str]) -> Tuple[int, Optional[datetime]]:
+        idx, img_path = idx_img
+        return idx, read_exif_datetime(img_path)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 2)) as executor:
+        for idx, dt in executor.map(worker, list(enumerate(images))):
+            results[idx] = dt
+
+    out: List[str] = []
+    for img_path, dt in zip(images, results):
+        if dt is not None:
+            out.append(dt.strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            filename = os.path.basename(img_path)
+            if any(ch.isdigit() for ch in filename):
+                out.append(filename)
+            else:
+                out.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    return out
+
+
+def get_codec_for_output(output: str) -> Tuple[int, str]:
+    """Choose fourcc and human-readable codec name from output extension."""
+    ext = os.path.splitext(output)[1].lower()
+    if ext == ".mov":
+        return cv2.VideoWriter_fourcc(*"avc1"), "H.264 (avc1) in .mov"
+    if ext in [".mp4", ".m4v"]:
+        return cv2.VideoWriter_fourcc(*"mp4v"), "H.264 (mp4v) in .mp4/.m4v"
+    if ext == ".mkv":
+        return cv2.VideoWriter_fourcc(*"X264"), "H.264 (X264) in .mkv"
+    return cv2.VideoWriter_fourcc(*"mp4v"), "H.264 (mp4v) default"
+
+
+def draw_timestamp_on_frame(
+    frame: np.ndarray,
+    text: str,
+    margin: int = 10,
+    box_alpha: float = 0.5,
+    text_color: Tuple[int, int, int] = (255, 255, 255),
+    box_color: Tuple[int, int, int] = (0, 0, 0),
+) -> np.ndarray:
+    """Fast OpenCV overlay of semi-transparent box and timestamp text in lower-right."""
+    height, width = frame.shape[:2]
+
+    # Auto scale font relative to width
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.5, min(1.5, width / 1600.0))
+    thickness = max(1, int(round(2 * scale)))
+
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    x = width - text_w - margin
+    y = height - margin
+
+    # Background rectangle coordinates
+    top_left = (x - 6, y - text_h - 6)
+    bottom_right = (x + text_w + 6, y + baseline + 4)
+
+    # Blend semi-transparent rectangle
+    overlay = frame.copy()
+    cv2.rectangle(overlay, top_left, bottom_right, box_color, thickness=cv2.FILLED)
+    cv2.addWeighted(overlay, box_alpha, frame, 1 - box_alpha, 0, dst=frame)
+
+    # Text
+    cv2.putText(frame, text, (x, y), font, scale, text_color, thickness, cv2.LINE_AA)
+    return frame
+
 @cli.command('create-timelapse')
 @click.argument('folder', type=click.Path(exists=True, file_okay=False))
-@click.option('--fps', default=24, help='Frames per second for the output video.')
-@click.option('--output', default='output.mov', help='Output video file name (H.264 in .mov container).')
+@click.option('--fps', default=24, show_default=True, help='Frames per second for the output video.')
+@click.option('--output', default='output.mov', show_default=True, help='Output video file name (H.264 in .mov container).')
 @click.option('--crf', type=int, default=None, help='Compress output using ffmpeg with given CRF (lower is better, 18-28).')
-def create_timelapse(folder, fps, output, crf):
+@click.option('--timestamp', is_flag=True, default=False, help='Add timestamp overlay to the lower right corner of each frame.')
+def create_timelapse(folder, fps, output, crf, timestamp):
     """
     Create a time-lapse video from images in a folder.
     :param folder: Path to the folder containing images.
     :param fps: frames per second for the output video.
     :param output: filename for the output video.
+    :param crf: compression quality for ffmpeg (optional).
+    :param timestamp: whether to add timestamp overlay to frames.
     :return: None
     """
-    images = sorted([
-        os.path.join(folder, f)
-        for f in os.listdir(folder)
-        if f.lower().endswith(('.png', '.jpg', '.jpeg'))
-    ])
+    folder_path = Path(folder)
+    images = list_image_paths(folder_path, (".png", ".jpg", ".jpeg"))
     if not images:
         click.secho('No images found in the folder.', fg='red')
         return
@@ -45,19 +155,7 @@ def create_timelapse(folder, fps, output, crf):
     height, width, _ = frame.shape
 
     # Select codec based on file extension
-    ext = os.path.splitext(output)[1].lower()
-    if ext == ".mov":
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 for .mov
-        codec_name = "H.264 (avc1) in .mov"
-    elif ext in [".mp4", ".m4v"]:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # H.264/MP4
-        codec_name = "H.264 (mp4v) in .mp4/.m4v"
-    elif ext == ".mkv":
-        fourcc = cv2.VideoWriter_fourcc(*'X264')  # H.264 for .mkv
-        codec_name = "H.264 (X264) in .mkv"
-    else:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Default to mp4v
-        codec_name = "H.264 (mp4v) default"
+    fourcc, codec_name = get_codec_for_output(output)
 
     click.secho("=== Timelapse Creation Details ===", fg='cyan', bold=True)
     click.secho(f"Images used: {len(images)}", fg='blue')
@@ -67,15 +165,28 @@ def create_timelapse(folder, fps, output, crf):
     click.secho(f"Output file: {output}", fg='blue')
     click.secho(f"First image: {os.path.basename(images[0])}", fg='blue')
     click.secho(f"Last image: {os.path.basename(images[-1])}", fg='blue')
+    if timestamp:
+        click.secho("Timestamps: Enabled", fg='blue')
     click.secho("=" * 32, fg='cyan')
 
     out = cv2.VideoWriter(output, fourcc, fps, (width, height))
 
+    # Precompute timestamps once (parallel) to avoid EXIF reads per frame
+    timestamps: Optional[List[str]] = None
+    if timestamp:
+        timestamps = precompute_timestamps(images)
+
     with click.progressbar(images, label="Creating timelapse") as bar:
-        for img_path in bar:
+        for idx, img_path in enumerate(bar):
             img = cv2.imread(img_path)
+            if img is None:
+                continue
             if img.shape[:2] != (height, width):
-                img = cv2.resize(img, (width, height))
+                img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+
+            if timestamp and timestamps is not None:
+                img = draw_timestamp_on_frame(img, timestamps[idx])
+
             out.write(img)
 
     out.release()
@@ -120,9 +231,9 @@ def is_excluded_day(dt, excluded_days):
 
 @cli.command('remove-photos')
 @click.argument('search_dir', type=click.Path(exists=True, file_okay=False))
-@click.option('--exclude-time', default='22:30-04:30', help='Timeframe to exclude (e.g., 22:30-04:30)')
-@click.option('--exclude-days', default='sat,sun', help='Days to exclude (comma-separated, e.g., sat,sun)')
-@click.option('--restore-removed', is_flag=True, default=False, help='Move previously removed images back before running removal.')
+@click.option('--exclude-time', default='22:30-04:30', show_default=True, help='Timeframe to exclude (e.g., 22:30-04:30)')
+@click.option('--exclude-days', default='sat,sun', show_default=True, help='Days to exclude (comma-separated, e.g., sat,sun)')
+@click.option('--restore-removed', is_flag=True, default=False, show_default=True, help='Move previously removed images back before running removal.')
 @click.option('--rename', type=str, default=None, help='Rename all files using EXIF date/time and this suffix, e.g. "Own_Name".')
 def remove_photos(search_dir, exclude_time, exclude_days, restore_removed, rename):
     search_dir = Path(search_dir)
@@ -145,38 +256,24 @@ def remove_photos(search_dir, exclude_time, exclude_days, restore_removed, renam
     start_min, end_min = parse_timeframe(exclude_time)
     excluded_days = parse_days(exclude_days)
 
-    exts = (".jpg", ".jpeg", ".png", ".tiff", ".tif", ".raw", ".cr2", ".nef", ".arw")
-    files = []
-    for root, _, filenames in os.walk(search_dir):
-        root_path = Path(root)
-        for f in filenames:
-            if f.lower().endswith(exts):
-                files.append(str(root_path / f))
+    files = list_images_recursive(search_dir, ALLOWED_IMAGE_EXTENSIONS)
 
     if not files:
         click.secho("No image files found.", fg='red')
         return
 
-    total, moved, skipped = 0, 0, 0
-    for file_path in files:
-        total += 1
-        dt_str = None
-        try:
-            with open(file_path, 'rb') as f:
-                tags = exifread.process_file(f, stop_tag="EXIF DateTimeOriginal", details=False)
-                dt_str = str(tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime"))
-        except Exception:
-            dt_str = None
+    # Pre-read EXIF datetimes in parallel
+    dts: List[Optional[datetime]] = [None] * len(files)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 2)) as executor:
+        for idx, dt in executor.map(lambda p: (p[0], read_exif_datetime(p[1])), list(enumerate(files))):
+            dts[idx] = dt
 
+    total, moved, skipped = 0, 0, 0
+    for file_path, dt in zip(files, dts):
+        total += 1
         file_path_obj = Path(file_path)
-        if not dt_str or dt_str == "None":
+        if dt is None:
             click.secho(f"Skipping '{file_path_obj}' - No EXIF date/time found", fg='yellow')
-            skipped += 1
-            continue
-        try:
-            dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-        except Exception:
-            click.secho(f"Skipping '{file_path_obj}' - Invalid date format", fg='yellow')
             skipped += 1
             continue
 
@@ -230,8 +327,7 @@ def batch_crop(input_folder, output_folder, start_x, start_y, end_x, end_y, rota
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    exts = (".jpg", ".jpeg", ".png", ".tiff")
-    files = [f for f in input_folder.iterdir() if f.suffix.lower() in exts and f.is_file()]
+    files = [f for f in input_folder.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".tiff") and f.is_file()]
     if not files:
         click.secho("No image files found.", fg='red')
         return
@@ -273,24 +369,21 @@ def normalize_intervals(input_folder, output_folder, target_minutes):
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    exts = (".jpg", ".jpeg", ".png", ".tiff")
-    files = [f for f in input_folder.iterdir() if f.suffix.lower() in exts and f.is_file()]
+    files = [f for f in input_folder.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".tiff") and f.is_file()]
     if not files:
         click.secho("No image files found.", fg='red')
         return
 
-    # Extract timestamps and sort
-    images_with_dt = []
-    for img_path in files:
-        try:
-            with open(img_path, 'rb') as f:
-                tags = exifread.process_file(f, stop_tag="EXIF DateTimeOriginal", details=False)
-                dt_str = str(tags.get("EXIF DateTimeOriginal") or tags.get("Image DateTime"))
-            if dt_str and dt_str != "None":
-                dt = datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-                images_with_dt.append((dt, img_path))
-        except Exception:
-            continue
+    # Extract timestamps (parallel) and sort
+    dts: List[Optional[datetime]] = [None] * len(files)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 2)) as executor:
+        for idx, dt in executor.map(lambda p: (p[0], read_exif_datetime(str(p[1]))), list(enumerate(files))):
+            dts[idx] = dt
+
+    images_with_dt: List[Tuple[datetime, Path]] = []
+    for file_path, dt in zip(files, dts):
+        if dt is not None:
+            images_with_dt.append((dt, file_path))
 
     images_with_dt.sort()
     if not images_with_dt:
@@ -328,7 +421,7 @@ def normalize_intervals(input_folder, output_folder, target_minutes):
             counter += 1
         result.append((dt, img_path, out_path))
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 2)) as executor:
         list(executor.map(lambda args: copy_image(*args), result))
 
     click.secho(f"Normalized sequence saved to {output_folder}", fg='green')
