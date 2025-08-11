@@ -76,3 +76,14 @@ python pyelapse.py create-timelapse /path/to_image_folder/ --output output.mov -
 ```
 
 This will create `output.mov` and then compress it to `output_compressed.mov` using ffmpeg.
+
+### Timestamps on frames
+
+To overlay the EXIF date/time in the lower-right corner of each frame while creating the timelapse, add `--timestamp`:
+
+```bash
+python pyelapse.py create-timelapse /path/to_image_folder/ --output output.mp4 --fps 24 --timestamp
+```
+
+- If EXIF `DateTimeOriginal` is present, that timestamp is used.
+- If EXIF is missing, the script falls back to the filename (if it contains digits), otherwise to the current date/time at build.
