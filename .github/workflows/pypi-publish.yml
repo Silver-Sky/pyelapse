@@ -21,6 +21,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -35,6 +37,12 @@ jobs:
           TAG="${GITHUB_REF##*/}"
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Switch to master branch
+        run: |
+          git fetch origin master:master
+          git checkout master
+          git pull --ff-only origin master
 
       - name: Update version in pyproject.toml
         run: |
