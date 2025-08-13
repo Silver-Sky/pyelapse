@@ -12,6 +12,7 @@ import exifread
 
 from datetime import datetime, timedelta
 import concurrent.futures
+import numpy as np
  
 
 
@@ -82,6 +83,31 @@ def precompute_timestamps(images: Sequence[str]) -> List[str]:
             else:
                 out.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     return out
+
+
+def parse_normalized_filename_dt(path: Path) -> Optional[datetime]:
+    """Parse timestamps from normalized filenames like YYYY-MM-DD-HH-MM-SS[-counter].ext"""
+    try:
+        stem = path.stem
+        parts = stem.split("-")
+        # Expect at least 6 parts for YYYY MM DD HH MM SS
+        if len(parts) < 6:
+            return None
+        base_parts = parts[:6]
+        base_str = "-".join(base_parts)
+        return datetime.strptime(base_str, "%Y-%m-%d-%H-%M-%S")
+    except Exception:
+        return None
+
+
+def find_last_normalized_dt(output_folder: Path) -> Optional[datetime]:
+    latest: Optional[datetime] = None
+    for p in output_folder.iterdir():
+        if p.is_file():
+            dt = parse_normalized_filename_dt(p)
+            if dt is not None and (latest is None or dt > latest):
+                latest = dt
+    return latest
 
 
 def get_codec_for_output(output: str) -> Tuple[int, str]:
@@ -169,28 +195,124 @@ def create_timelapse(folder, fps, output, crf, timestamp):
         click.secho("Timestamps: Enabled", fg='blue')
     click.secho("=" * 32, fg='cyan')
 
-    out = cv2.VideoWriter(output, fourcc, fps, (width, height))
+    output_path = Path(output)
+    state_path = output_path.with_suffix(output_path.suffix + ".state.json")
 
-    # Precompute timestamps once (parallel) to avoid EXIF reads per frame
-    timestamps: Optional[List[str]] = None
-    if timestamp:
-        timestamps = precompute_timestamps(images)
+    # Determine incremental start index using state
+    start_idx = 0
+    last_image_path: Optional[str] = None
+    if state_path.exists():
+        try:
+            import json as _json
+            with open(state_path, "r", encoding="utf-8") as f:
+                st = _json.load(f)
+                last_image_path = st.get("last_image")
+        except Exception:
+            last_image_path = None
+    if last_image_path and last_image_path in images:
+        try:
+            start_idx = images.index(last_image_path) + 1
+        except ValueError:
+            start_idx = 0
 
-    with click.progressbar(images, label="Creating timelapse") as bar:
-        for idx, img_path in enumerate(bar):
-            img = cv2.imread(img_path)
-            if img is None:
-                continue
-            if img.shape[:2] != (height, width):
-                img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+    images_to_process = images[start_idx:] if start_idx < len(images) else []
 
-            if timestamp and timestamps is not None:
-                img = draw_timestamp_on_frame(img, timestamps[idx])
+    if not output_path.exists():
+        # Fresh build: write all frames
+        out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
-            out.write(img)
+        # Precompute timestamps for all images if needed
+        timestamps: Optional[List[str]] = None
+        if timestamp:
+            timestamps = precompute_timestamps(images)
 
-    out.release()
-    click.secho(f"Time-lapse video saved as {output}", fg='green', bold=True)
+        with click.progressbar(images, label="Creating timelapse") as bar:
+            for idx, img_path in enumerate(bar):
+                img = cv2.imread(img_path)
+                if img is None:
+                    continue
+                if img.shape[:2] != (height, width):
+                    img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+
+                if timestamp and timestamps is not None:
+                    img = draw_timestamp_on_frame(img, timestamps[idx])
+
+                out.write(img)
+        out.release()
+        click.secho(f"Time-lapse video saved as {output}", fg='green', bold=True)
+    else:
+        # Append only new frames, then concat with existing video
+        if not images_to_process:
+            click.secho("No new images to append.", fg='yellow')
+        else:
+            part_output = output_path.with_stem(output_path.stem + "_part")
+            out_part = cv2.VideoWriter(str(part_output), fourcc, fps, (width, height))
+
+            timestamps_part: Optional[List[str]] = None
+            if timestamp:
+                timestamps_part = precompute_timestamps(images_to_process)
+
+            with click.progressbar(images_to_process, label="Appending frames") as bar:
+                for idx_rel, img_path in enumerate(bar):
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        continue
+                    if img.shape[:2] != (height, width):
+                        img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+
+                    if timestamp and timestamps_part is not None:
+                        img = draw_timestamp_on_frame(img, timestamps_part[idx_rel])
+
+                    out_part.write(img)
+            out_part.release()
+
+            # Concat existing output with part using ffmpeg stream copy
+            concat_list = output_path.with_suffix(output_path.suffix + ".concat.txt")
+            with open(concat_list, "w", encoding="utf-8") as f:
+                f.write(f"file '{str(output_path).replace("'", "'\\''")}'\n")
+                f.write(f"file '{str(part_output).replace("'", "'\\''")}'\n")
+
+            merged_output = output_path.with_suffix(output_path.suffix + ".tmp")
+            cmd = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", str(concat_list), "-c", "copy", str(merged_output)
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode == 0 and merged_output.exists():
+                # Replace original
+                try:
+                    os.replace(str(merged_output), str(output_path))
+                    click.secho(f"Appended {len(images_to_process)} frames to {output}", fg='green', bold=True)
+                finally:
+                    try:
+                        os.remove(concat_list)
+                    except Exception:
+                        pass
+                    try:
+                        os.remove(part_output)
+                    except Exception:
+                        pass
+            else:
+                click.secho(f"Concat failed: {result.stderr.decode()}", fg='red')
+                # Cleanup partials
+                try:
+                    os.remove(concat_list)
+                except Exception:
+                    pass
+                try:
+                    os.remove(part_output)
+                except Exception:
+                    pass
+
+    # Update state
+    try:
+        import json as _json
+        last_img = images[-1] if images else None
+        if last_img:
+            with open(state_path, "w", encoding="utf-8") as f:
+                _json.dump({"last_image": last_img}, f)
+    except Exception:
+        pass
 
     # Compress with ffmpeg if requested
     if crf is not None:
@@ -390,14 +512,19 @@ def normalize_intervals(input_folder, output_folder, target_minutes):
         click.secho("No images with valid EXIF date/time found.", fg='red')
         return
 
-    # Determine the range
+    # Determine the range and incremental start
     first_dt = images_with_dt[0][0]
     last_dt = images_with_dt[-1][0]
     target_delta = target_minutes * 60  # seconds
+    existing_last_dt = find_last_normalized_dt(output_folder)
+    if existing_last_dt is not None:
+        start_dt = max(first_dt, existing_last_dt + timedelta(seconds=target_delta))
+    else:
+        start_dt = first_dt
 
-    # Build normalized timeline
+    # Build normalized timeline starting after existing outputs (incremental)
     normalized_times = []
-    t = first_dt
+    t = start_dt
     while t <= last_dt:
         normalized_times.append(t)
         t = t + timedelta(seconds=target_delta)
@@ -421,10 +548,16 @@ def normalize_intervals(input_folder, output_folder, target_minutes):
             counter += 1
         result.append((dt, img_path, out_path))
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 2)) as executor:
-        list(executor.map(lambda args: copy_image(*args), result))
+    added = 0
+    if result:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 2)) as executor:
+            list(executor.map(lambda args: copy_image(*args), result))
+        added = len(result)
 
-    click.secho(f"Normalized sequence saved to {output_folder}", fg='green')
+    if existing_last_dt is None:
+        click.secho(f"Normalized sequence saved to {output_folder} (frames: {added})", fg='green')
+    else:
+        click.secho(f"Appended {added} new frames to {output_folder}", fg='green' if added > 0 else 'yellow')
 
 
 if __name__ == '__main__':

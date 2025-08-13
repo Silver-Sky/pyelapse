@@ -7,9 +7,6 @@ folders=("1_Aushub_full" "2_Keller" "3_Keller_ferien" "4_Kanalisation")
 # folders=("4_Kanalisation")
 
 for interval in "${intervals[@]}"; do
-    norm_folder="/Volumes/T7/time-elapse-data/images/Time-Elapse-Normalized-${interval}min/"
-    rm -rf "${norm_folder}"
-    mkdir -p "${norm_folder}"
     for folder in "${folders[@]}"; do
         python pyelapse.py normalize-intervals "/Volumes/T7/time-elapse-data/images/${folder}/" "$norm_folder" --target-minutes "$interval"
     done
