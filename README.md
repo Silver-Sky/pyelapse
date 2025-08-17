@@ -16,6 +16,20 @@ pyelapse create-timelapse /path/to_image_folder/ --output path/time-elapse-video
 ## install
 
 pip install pyelapse
+# On macOS (using Homebrew):
+```bash
+# On Ubuntu/Debian:
+sudo apt update && sudo apt install ffmpeg
+
+# On Windows (using Chocolatey):
+choco install ffmpeg
+
+brew install python
+
+# us pip to install the required packages:
+pip install pyelapse
+```
+
 
 ## Remove Photos
 

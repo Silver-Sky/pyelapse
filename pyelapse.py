@@ -16,6 +16,9 @@ import numpy as np
  
 
 
+def _check_ffmpeg_installed() -> bool:
+    return shutil.which("ffmpeg") is not None
+
 @click.group()
 def cli():
     """PyElapse CLI - Create time-lapse videos from images."""
@@ -171,6 +174,10 @@ def create_timelapse(folder, fps, output, crf, timestamp):
     :param timestamp: whether to add timestamp overlay to frames.
     :return: None
     """
+    # --- Check for ffmpeg availability early ---
+    if not _check_ffmpeg_installed():
+        raise click.ClickException("ffmpeg is not installed or not found in PATH. Please install it to use video features.")
+
     folder_path = Path(folder)
     images = list_image_paths(folder_path, (".png", ".jpg", ".jpeg"))
     if not images:
@@ -272,7 +279,8 @@ def create_timelapse(folder, fps, output, crf, timestamp):
                 f.write(f"file '{str(output_path).replace("'", "'\\''")}'\n")
                 f.write(f"file '{str(part_output).replace("'", "'\\''")}'\n")
 
-            merged_output = output_path.with_suffix(output_path.suffix + ".tmp")
+            # Keep the original container extension so ffmpeg can infer the muxer (e.g., .tmp.mov instead of .mov.tmp)
+            merged_output = output_path.with_name(output_path.stem + ".tmp" + output_path.suffix)
             cmd = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                 "-i", str(concat_list), "-c", "copy", str(merged_output)
@@ -315,7 +323,11 @@ def create_timelapse(folder, fps, output, crf, timestamp):
         pass
 
     # Compress with ffmpeg if requested
+    # Compress with ffmpeg if requested
     if crf is not None:
+        if not _check_ffmpeg_installed():
+            click.secho("ffmpeg is not installed or not found in PATH. Skipping compression.", fg='yellow')
+            return
         compressed_output = Path(output).with_stem(Path(output).stem + "_compressed")
         cmd = [
             "ffmpeg", "-y", "-i", output,
