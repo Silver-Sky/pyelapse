@@ -80,6 +80,13 @@ python pyelapse.py normalize-intervals /path/to_input_folder/ /path/to_output_fo
 
 - This will duplicate or skip frames as needed so all intervals match the target (e.g., 1 minute).
 - Use the output folder as input for your time-lapse creation.
+- To avoid long stretches of duplicated frames when there are big gaps in your source photos, you can configure a maximum gap multiplier. If the gap between two consecutive photos exceeds this multiple of the target interval, the gap is left empty (no duplicated frames are generated):
+
+```bash
+python pyelapse.py normalize-intervals /path/to_input_folder/ /path/to_output_folder/ --target-minutes 15 --max-gap-multiplier 3
+```
+
+The example above will not fill gaps larger than 45 minutes (15 min * 3). A state file normalize-intervals.state.json is written to the output folder with a summary of the run, including frames skipped due to large gaps.
 
 ## Create Timelapse Video
 
