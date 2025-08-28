@@ -7,15 +7,8 @@ import click
 import subprocess
 import shutil
 from pathlib import Path
-from PIL import Image, ImageOps
+from PIL import Image
 import exifread
-# Enable HEIC support via Pillow if available
-try:
-    from pillow_heif import register_heif_opener
-    register_heif_opener()
-    _HEIF_ENABLED = True
-except Exception:
-    _HEIF_ENABLED = False
 
 from datetime import datetime, timedelta
 import concurrent.futures
@@ -37,7 +30,7 @@ def cli():
 # -----------------------------
 
 ALLOWED_IMAGE_EXTENSIONS: Tuple[str, ...] = (
-    ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".heic", ".raw", ".cr2", ".nef", ".arw"
+    ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".raw", ".cr2", ".nef", ".arw"
 )
 
 
@@ -58,22 +51,6 @@ def list_images_recursive(folder: Path, allowed_exts: Sequence[str]) -> List[str
 
 def read_exif_datetime(path: str) -> Optional[datetime]:
     try:
-        suffix = os.path.splitext(path)[1].lower()
-        # HEIC: use Pillow EXIF because exifread doesn't support HEIC containers
-        if suffix == ".heic":
-            try:
-                with Image.open(path) as im:
-                    exif = im.getexif()
-                    if exif:
-                        # 36867: DateTimeOriginal, 306: Image DateTime
-                        for tag_id in (36867, 306):
-                            val = exif.get(tag_id)
-                            if val:
-                                dt_str = str(val)
-                                return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
-            except Exception:
-                return None
-        # Default path for JPEG/TIFF and others supported by exifread
         with open(path, "rb") as f:
             tags = exifread.process_file(
                 f, stop_tag="EXIF DateTimeOriginal", details=False
@@ -181,21 +158,6 @@ def draw_timestamp_on_frame(
     cv2.putText(frame, text, (x, y), font, scale, text_color, thickness, cv2.LINE_AA)
     return frame
 
-
-def imread_any(img_path: str) -> Optional[np.ndarray]:
-    """Read image from path using Pillow to honor EXIF Orientation, then convert to BGR ndarray.
-    Falls back to OpenCV if Pillow fails.
-    """
-    try:
-        with Image.open(img_path) as im:
-            im = ImageOps.exif_transpose(im)
-            rgb = im.convert("RGB")
-            arr = np.array(rgb)
-            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    except Exception:
-        # Fallback for formats Pillow can't read
-        return cv2.imread(img_path)
-
 @cli.command('create-timelapse')
 @click.argument('folder', type=click.Path(exists=True, file_okay=False))
 @click.option('--fps', default=24, show_default=True, help='Frames per second for the output video.')
@@ -217,23 +179,13 @@ def create_timelapse(folder, fps, output, crf, timestamp):
         raise click.ClickException("ffmpeg is not installed or not found in PATH. Please install it to use video features.")
 
     folder_path = Path(folder)
-    images = list_image_paths(folder_path, (".png", ".jpg", ".jpeg", ".heic"))
+    images = list_image_paths(folder_path, (".png", ".jpg", ".jpeg"))
     if not images:
         click.secho('No images found in the folder.', fg='red')
         return
 
-    # Read first readable frame to determine dimensions
-    frame = None
-    first_readable_path: Optional[str] = None
-    for p in images:
-        frame = imread_any(p)
-        if frame is not None:
-            first_readable_path = p
-            break
-    if frame is None:
-        click.secho('No readable images found (unsupported formats?).', fg='red')
-        return
-    height, width = frame.shape[:2]
+    frame = cv2.imread(images[0])
+    height, width, _ = frame.shape
 
     # Select codec based on file extension
     fourcc, codec_name = get_codec_for_output(output)
@@ -283,13 +235,15 @@ def create_timelapse(folder, fps, output, crf, timestamp):
 
         with click.progressbar(images, label="Creating timelapse") as bar:
             for idx, img_path in enumerate(bar):
-                img = imread_any(img_path)
+                img = cv2.imread(img_path)
                 if img is None:
                     continue
                 if img.shape[:2] != (height, width):
                     img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+
                 if timestamp and timestamps is not None:
                     img = draw_timestamp_on_frame(img, timestamps[idx])
+
                 out.write(img)
         out.release()
         click.secho(f"Time-lapse video saved as {output}", fg='green', bold=True)
@@ -307,7 +261,7 @@ def create_timelapse(folder, fps, output, crf, timestamp):
 
             with click.progressbar(images_to_process, label="Appending frames") as bar:
                 for idx_rel, img_path in enumerate(bar):
-                    img = imread_any(img_path)
+                    img = cv2.imread(img_path)
                     if img is None:
                         continue
                     if img.shape[:2] != (height, width):
@@ -507,7 +461,7 @@ def batch_crop(input_folder, output_folder, start_x, start_y, end_x, end_y, rota
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    files = [f for f in input_folder.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".tiff", ".heic") and f.is_file()]
+    files = [f for f in input_folder.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".tiff") and f.is_file()]
     if not files:
         click.secho("No image files found.", fg='red')
         return
@@ -515,21 +469,13 @@ def batch_crop(input_folder, output_folder, start_x, start_y, end_x, end_y, rota
     def process_image(img_path):
         try:
             with Image.open(img_path) as im:
-                # Auto-orient based on EXIF
-                im = ImageOps.exif_transpose(im)
-                exif = im.getexif()
-                # Reset Orientation to 1 after transpose
-                if exif is not None and len(exif):
-                    exif[274] = 1  # Orientation tag
-                    exif_bytes = exif.tobytes()
-                else:
-                    exif_bytes = None
+                exif = im.info.get('exif')
                 if rotate != 0.0:
                     im = im.rotate(-rotate, expand=True, resample=Image.BICUBIC)
                 cropped = im.crop((start_x, start_y, end_x, end_y))
                 out_path = output_folder / img_path.name
-                if exif_bytes:
-                    cropped.save(out_path, exif=exif_bytes)
+                if exif:
+                    cropped.save(out_path, exif=exif)
                 else:
                     cropped.save(out_path)
             return f"Cropped and saved: {img_path.name}"
@@ -541,45 +487,23 @@ def batch_crop(input_folder, output_folder, start_x, start_y, end_x, end_y, rota
     for res in results:
         click.secho(res, fg='green' if res.startswith("Cropped") else 'red')
 
-def write_oriented_image(dt, img_path, out_path):
-    """Write image to out_path after applying EXIF Orientation. Preserve other EXIF, set Orientation=1.
-    Falls back to copying if anything fails.
-    """
-    try:
-        with Image.open(img_path) as im:
-            im = ImageOps.exif_transpose(im)
-            exif = im.getexif()
-            exif_bytes = None
-            if exif is not None and len(exif):
-                exif[274] = 1  # Orientation
-                try:
-                    exif_bytes = exif.tobytes()
-                except Exception:
-                    exif_bytes = None
-            if exif_bytes:
-                im.save(out_path, exif=exif_bytes)
-            else:
-                im.save(out_path)
-    except Exception:
-        shutil.copy2(img_path, out_path)
+def copy_image(dt, img_path, out_path):
+    shutil.copy2(img_path, out_path)
     return out_path
 
 @cli.command('normalize-intervals')
 @click.argument('input_folder', type=click.Path(exists=True, file_okay=False))
 @click.argument('output_folder', type=click.Path())
 @click.option('--target-minutes', type=int, default=1, show_default=True, help='Target interval in minutes between frames.')
-@click.option('--max-gap-multiplier', type=float, default=3.0, show_default=True,
-              help='If the gap between consecutive photos exceeds this multiple of the target interval, do not fill it with duplicated frames.')
-def normalize_intervals(input_folder, output_folder, target_minutes, max_gap_multiplier):
+def normalize_intervals(input_folder, output_folder, target_minutes):
     """
     Normalize image intervals by skipping or duplicating frames so all intervals are exactly target_minutes apart.
-    If a gap between two real photos exceeds max_gap_multiplier * target_minutes, the gap is left empty (no duplicated frames).
     """
     input_folder = Path(input_folder)
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    files = [f for f in input_folder.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".tiff", ".heic") and f.is_file()]
+    files = [f for f in input_folder.iterdir() if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".tiff") and f.is_file()]
     if not files:
         click.secho("No image files found.", fg='red')
         return
@@ -604,45 +528,28 @@ def normalize_intervals(input_folder, output_folder, target_minutes, max_gap_mul
     first_dt = images_with_dt[0][0]
     last_dt = images_with_dt[-1][0]
     target_delta = target_minutes * 60  # seconds
-    threshold_seconds = max_gap_multiplier * target_delta
     existing_last_dt = find_last_normalized_dt(output_folder)
     if existing_last_dt is not None:
         start_dt = max(first_dt, existing_last_dt + timedelta(seconds=target_delta))
     else:
         start_dt = first_dt
 
-    # Precompute which consecutive image pairs constitute large gaps
-    large_gap_pairs: List[int] = []  # indices i where gap from i -> i+1 is large
-    for i in range(len(images_with_dt) - 1):
-        gap_sec = (images_with_dt[i + 1][0] - images_with_dt[i][0]).total_seconds()
-        if gap_sec > threshold_seconds:
-            large_gap_pairs.append(i)
-
     # Build normalized timeline starting after existing outputs (incremental)
-    normalized_times: List[datetime] = []
+    normalized_times = []
     t = start_dt
     while t <= last_dt:
         normalized_times.append(t)
         t = t + timedelta(seconds=target_delta)
 
     # For each normalized time, find the closest image at or before that time
-    result: List[Tuple[datetime, Path, Path]] = []
+    result = []
     img_idx = 0
-    skipped_due_to_large_gap = 0
     for norm_time in normalized_times:
         # Advance img_idx to the last image at or before norm_time
         while img_idx + 1 < len(images_with_dt) and images_with_dt[img_idx + 1][0] <= norm_time:
             img_idx += 1
-        # If we are between a large gap, skip generating frames until the next real image time
-        if img_idx < len(images_with_dt) - 1:
-            next_dt = images_with_dt[img_idx + 1][0]
-            cur_dt = images_with_dt[img_idx][0]
-            gap_sec = (next_dt - cur_dt).total_seconds()
-            if gap_sec > threshold_seconds and cur_dt < norm_time < next_dt:
-                skipped_due_to_large_gap += 1
-                continue
         dt, img_path = images_with_dt[img_idx]
-        # Use normalized timeline time for filename, add a counter if needed
+        # Use EXIF date/time for filename, add a counter if needed
         base_name = norm_time.strftime("%Y-%m-%d-%H-%M-%S")
         out_name = f"{base_name}{img_path.suffix.lower()}"
         out_path = output_folder / out_name
@@ -656,35 +563,13 @@ def normalize_intervals(input_folder, output_folder, target_minutes, max_gap_mul
     added = 0
     if result:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 2)) as executor:
-            list(executor.map(lambda args: write_oriented_image(*args), result))
+            list(executor.map(lambda args: copy_image(*args), result))
         added = len(result)
 
-    # Write a state file describing the normalization run
-    try:
-        import json as _json
-        state_data = {
-            "target_minutes": target_minutes,
-            "max_gap_multiplier": max_gap_multiplier,
-            "target_delta_seconds": target_delta,
-            "large_gap_threshold_seconds": threshold_seconds,
-            "large_gaps_count": len(large_gap_pairs),
-            "frames_written": added,
-            "frames_skipped_large_gaps": skipped_due_to_large_gap,
-            "first_input_dt": first_dt.isoformat(),
-            "last_input_dt": last_dt.isoformat(),
-            "start_normalized_dt": start_dt.isoformat(),
-            "end_normalized_dt": (normalized_times[-1].isoformat() if normalized_times else None),
-        }
-        state_path = Path(output_folder) / "normalize-intervals.state.json"
-        with open(state_path, "w", encoding="utf-8") as f:
-            _json.dump(state_data, f, indent=2)
-    except Exception:
-        pass
-
     if existing_last_dt is None:
-        click.secho(f"Normalized sequence saved to {output_folder} (frames: {added}, skipped due to large gaps: {skipped_due_to_large_gap})", fg='green')
+        click.secho(f"Normalized sequence saved to {output_folder} (frames: {added})", fg='green')
     else:
-        click.secho(f"Appended {added} new frames to {output_folder} (skipped due to large gaps: {skipped_due_to_large_gap})", fg='green' if added > 0 else 'yellow')
+        click.secho(f"Appended {added} new frames to {output_folder}", fg='green' if added > 0 else 'yellow')
 
 
 if __name__ == '__main__':
